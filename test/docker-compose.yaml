@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cdc-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: root # mysql -u root -p root
+      MYSQL_DATABASE: mydb
+    ports:
+      - "3306:3306"
+    command:
+      - --log-bin=mysql-bin
+      - --binlog-format=ROW
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-proot"]
+      interval: 5s
+      retries: 10
+
+  cdc-cli:
+    build: ..
+    container_name: cdc-cli
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./cdc-config.yaml:/app/cdc-config.yaml
+    entrypoint: ["cdc-cli"]
+    command: ["--mode", "init", "--apply=true"]
+
+  cdc-server:
+    build: ..
+    container_name: cdc-server
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      - ./cdc-config.yaml:/app/cdc-config.yaml
+    entrypoint: ["cdc-server"]
