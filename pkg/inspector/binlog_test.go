@@ -3,7 +3,7 @@ package inspector
 import (
 	"testing"
 
-	"github.com/downfa11-org/tabellarius/pkg/model"
+	"github.com/cursus-io/tabellarius/pkg/model"
 	"github.com/go-mysql-org/go-mysql/replication"
 )
 

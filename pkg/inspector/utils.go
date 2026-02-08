@@ -1,7 +1,6 @@
 package inspector
 
 import (
-	"database/sql"
 	"fmt"
 	"log"
 	"strings"
@@ -33,20 +32,13 @@ func (b *BinlogInspector) parseDSN() error {
 }
 
 func (b *BinlogInspector) fetchColumns(schema, table string) []string {
-	db, err := sql.Open(b.dbType.DriverName(), b.dsn)
-	if err != nil {
-		log.Printf("[binlog] failed to open db for fb: %v", err)
-		return nil
-	}
-	defer db.Close()
-
 	query := `
 		SELECT COLUMN_NAME
 		FROM INFORMATION_SCHEMA.COLUMNS
 		WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
 		ORDER BY ORDINAL_POSITION
 	`
-	rows, err := db.Query(query, schema, table)
+	rows, err := b.db.Query(query, schema, table)
 	if err != nil {
 		log.Printf("[binlog] failed to query columns for table %s.%s: %v", schema, table, err)
 		return nil
@@ -119,5 +111,33 @@ func isSystemSchema(schema []byte) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func splitKey(key string) (string, string) {
+	parts := strings.Split(key, ".")
+	if len(parts) != 2 {
+		return "", parts[0]
+	}
+	return parts[0], parts[1]
+}
+
+func (b *BinlogInspector) updatePKIndex(key string) {
+	meta, ok := b.tableMeta[key]
+	if !ok {
+		return
+	}
+
+	meta.pkIndex = -1
+	for i, col := range meta.columns {
+		if col == meta.pkName {
+			meta.pkIndex = i
+			break
+		}
+	}
+
+	if meta.pkIndex == -1 {
+		log.Printf("[binlog] pk %s not found in table %s after DDL, fallback to 0", meta.pkName, key)
+		meta.pkIndex = 0
 	}
 }

@@ -2,19 +2,22 @@ package inspector
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
-	"github.com/downfa11-org/tabellarius/pkg/config"
-	"github.com/downfa11-org/tabellarius/pkg/model"
-	"github.com/downfa11-org/tabellarius/pkg/util"
+	"github.com/cursus-io/tabellarius/pkg/config"
+	"github.com/cursus-io/tabellarius/pkg/model"
+	"github.com/cursus-io/tabellarius/pkg/util"
 
 	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-mysql-org/go-mysql/replication"
 )
 
 type BinlogInspector struct {
+	db       *sql.DB
 	dbType   model.DatabaseType
 	dsn      string
 	serverID uint32
@@ -33,12 +36,13 @@ type BinlogInspector struct {
 
 var _ Inspector[model.Event] = (*BinlogInspector)(nil)
 
-func NewBinlogInspector(dbType model.DatabaseType, schema, dsn, offsetPath string, serverID uint32, tables []config.Table) (*BinlogInspector, error) {
+func NewBinlogInspector(db *sql.DB, dbType model.DatabaseType, schema, dsn, offsetPath string, serverID uint32, tables []config.Table) (*BinlogInspector, error) {
 	if !dbType.IsBinlogBased() {
 		return nil, fmt.Errorf("db %s is not binlog based", dbType)
 	}
 
 	b := &BinlogInspector{
+		db:         db,
 		dbType:     dbType,
 		dsn:        dsn,
 		serverID:   serverID,
@@ -123,12 +127,27 @@ func (b *BinlogInspector) Start(ctx context.Context, out chan<- model.Event) err
 					continue
 				}
 
+				if strings.Contains(query, "ALTER TABLE") || strings.Contains(query, "CREATE TABLE") {
+					log.Printf("[schema] DDL detected: %s. Refreshing metadata...", query)
+
+					for key := range b.tableMeta {
+						schema, table := splitKey(key)
+						cols := b.fetchColumns(schema, table)
+
+						if len(cols) > 0 {
+							b.tableMeta[key].columns = cols
+							b.updatePKIndex(key)
+						}
+					}
+				}
+
 				if !isDML(e) {
+					eventTime := time.Unix(int64(ev.Header.Timestamp), 0)
 					offset := model.MySQLOffset{
 						File: b.currentFile,
 						Pos:  ev.Header.LogPos,
 					}
-					out <- model.NewBinlogDDLEvent(src, offset, b.currentTxID, query)
+					out <- model.NewBinlogDDLEvent(src, offset, eventTime, b.currentTxID, query)
 				} else {
 					if b.currentTxID == "" {
 						b.currentTxID = fmt.Sprintf("query:%d", ev.Header.LogPos)
@@ -149,11 +168,13 @@ func (b *BinlogInspector) Start(ctx context.Context, out chan<- model.Event) err
 				b.currentFile = string(e.NextLogName)
 			case *replication.XIDEvent, *replication.GTIDEvent, *replication.QueryEvent:
 				if b.currentTxID != "" {
+					eventTime := time.Unix(int64(ev.Header.Timestamp), 0)
+
 					offset := model.MySQLOffset{
 						File: b.currentFile,
 						Pos:  ev.Header.LogPos,
 					}
-					out <- model.NewTransactionBoundaryEvent(model.SourceType(b.dbType), offset, b.currentTxID, model.TxCommit)
+					out <- model.NewTransactionBoundaryEvent(model.SourceType(b.dbType), offset, eventTime, b.currentTxID, model.TxCommit)
 					if err := util.SaveJSON(b.offsetPath, offset); err != nil {
 						log.Printf("[binlog] failed to save offset: %v", err)
 					}
@@ -212,6 +233,7 @@ func (b *BinlogInspector) emitRowEvents(out chan<- model.Event, h *replication.E
 		b.currentTxID = fmt.Sprintf("tx:%d", h.LogPos)
 	}
 
+	eventTime := time.Unix(int64(h.Timestamp), 0)
 	meta, ok := b.tableMeta[table]
 	if !ok {
 		log.Printf("[binlog] warning: tableMeta missing for %s, generating default columns", table)
@@ -272,8 +294,17 @@ func (b *BinlogInspector) emitRowEvents(out chan<- model.Event, h *replication.E
 	}
 
 	if len(rowsData) > 0 {
-		out <- model.NewBinlogRowEvent(src, offset, b.currentTxID, []model.RowChange{
-			{Schema: schema, Table: tableName, Op: op, Rows: rowsData},
-		})
+		out <- model.NewBinlogRowEvent(
+			src,
+			offset,
+			eventTime,
+			b.currentTxID,
+			[]model.RowChange{
+				{
+					Schema: schema,
+					Table:  tableName,
+					Op:     op, Rows: rowsData,
+				},
+			})
 	}
 }

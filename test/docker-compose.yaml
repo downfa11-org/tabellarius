@@ -38,4 +38,5 @@ services:
         condition: service_healthy
     volumes:
       - ./cdc-config.yaml:/app/cdc-config.yaml
+      - ./cursus-config.yaml:/cursus-config.yaml
     entrypoint: ["cdc-server"]

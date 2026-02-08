@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/downfa11-org/tabellarius/pkg/bootstrap"
-	"github.com/downfa11-org/tabellarius/pkg/config"
+	"github.com/cursus-io/tabellarius/pkg/bootstrap"
+	"github.com/cursus-io/tabellarius/pkg/config"
 	_ "github.com/go-sql-driver/mysql"
 )
 

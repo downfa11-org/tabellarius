@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/downfa11-org/tabellarius/pkg/model"
+	"github.com/cursus-io/tabellarius/pkg/model"
 )
 
 func TestSaveLoadJSON(t *testing.T) {

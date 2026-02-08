@@ -1,8 +1,11 @@
 package model
 
+import "time"
+
 type Event interface {
 	Source() SourceType
 	Offset() Offset
+	Timestamp() time.Time
 }
 
 type SourceType string

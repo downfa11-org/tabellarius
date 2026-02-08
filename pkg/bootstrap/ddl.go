@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/downfa11-org/tabellarius/pkg/config"
+	"github.com/cursus-io/tabellarius/pkg/config"
 )
 
 func Init(db *sql.DB, cfg *config.Config) error {

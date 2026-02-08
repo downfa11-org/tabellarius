@@ -3,8 +3,8 @@ package source
 import (
 	"testing"
 
-	"github.com/downfa11-org/tabellarius/pkg/config"
-	"github.com/downfa11-org/tabellarius/pkg/model"
+	"github.com/cursus-io/tabellarius/pkg/config"
+	"github.com/cursus-io/tabellarius/pkg/model"
 )
 
 func TestNewFromConfig_MySQL(t *testing.T) {
@@ -19,7 +19,7 @@ func TestNewFromConfig_MySQL(t *testing.T) {
 		},
 	}
 
-	src := NewFromConfig(cfg)
+	src := NewFromConfig(nil, cfg)
 	if src == nil {
 		t.Fatal("expected source, got nil")
 	}
