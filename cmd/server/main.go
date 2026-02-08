@@ -6,11 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
-	"github.com/downfa11-org/tabellarius/pkg/bootstrap"
-	"github.com/downfa11-org/tabellarius/pkg/config"
-	"github.com/downfa11-org/tabellarius/pkg/source"
+	"github.com/cursus-io/tabellarius/pkg/bootstrap"
+	"github.com/cursus-io/tabellarius/pkg/config"
+	"github.com/cursus-io/tabellarius/pkg/source"
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -27,6 +30,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
+	defer db.Close()
 
 	log.Println("[OK] db connected")
 
@@ -39,11 +43,22 @@ func main() {
 		log.Fatalf("[FATAL] cdc_log table not found. bootstrap required")
 	}
 
-	src := source.NewFromConfig(cfg)
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	src := source.NewFromConfig(db, cfg)
 	src.Start(ctx)
 
-	select {}
+	sig := <-sigChan
+	log.Printf("[INFO] received signal (%s). starting graceful shutdown...", sig)
+
+	cancel()
+
+	time.Sleep(2 * time.Second)
+	log.Println("[OK] tabellarius stopped safely.")
 }
 
 func connectWithRetry(driver, dsn string, maxRetry int) (*sql.DB, error) {

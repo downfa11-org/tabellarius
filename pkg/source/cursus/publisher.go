@@ -4,17 +4,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 
-	"github.com/downfa11-org/tabellarius/pkg/model"
+	"github.com/cursus-io/tabellarius/pkg/model"
+	"github.com/downfa11-org/cursus/test/publisher/config" // todo. updated cursus package
+	"github.com/downfa11-org/cursus/test/publisher/producer"
 )
 
-type Publisher struct{}
+type Publisher struct {
+	pub *producer.Publisher
+}
 
 func NewCursusPublisher(addr string) *Publisher {
-	return &Publisher{}
+	cfg, err := config.LoadPublisherConfig() // "/config.yaml"
+	if err != nil {
+		fmt.Printf("Failed to load config: %v\n", err)
+		os.Exit(1)
+	}
+
+	pub, err := producer.NewPublisher(cfg)
+	if err != nil {
+		log.Printf("Failed to create publisher: %v", err)
+		return nil
+	}
+
+	return &Publisher{
+		pub: pub,
+	}
 }
 
 func (p *Publisher) Publish(evt model.Event) error {
+	if p.pub == nil {
+		return fmt.Errorf("broker publisher not initialized")
+	}
+
 	prefix := fmt.Sprintf("[publish] source=%s offset=%s type=%T", evt.Source(), evt.Offset().String(), evt)
 
 	switch e := evt.(type) {
@@ -47,6 +70,16 @@ func (p *Publisher) Publish(evt model.Event) error {
 		}
 	default:
 		log.Printf("%s [unknown event]", prefix)
+	}
+
+	eventJSON, err := json.Marshal(evt)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event: %w", err)
+	}
+
+	_, err = p.pub.PublishMessage(string(eventJSON))
+	if err != nil {
+		return fmt.Errorf("failed to publish message: %w", err)
 	}
 
 	return nil
