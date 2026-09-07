@@ -2,6 +2,7 @@ package cursus
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log"
@@ -9,16 +10,18 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cursus-io/cursus/sdk"
 	"github.com/cursus-io/tabellarius/pkg/model"
 )
 
 type fakePublisher struct {
-	message string
-	err     error
-	closed  bool
-	flushed bool
-	acked   uint64
-	noAck   bool
+	message     string
+	err         error
+	closed      bool
+	flushed     bool
+	sendCalls   int
+	flushCalls  int
+	flushErrors []error
 }
 
 func TestPublisherLogDoesNotRenderRowValues(t *testing.T) {
@@ -71,18 +74,19 @@ func TestPublisherLogDoesNotRenderDDLQuery(t *testing.T) {
 
 func (p *fakePublisher) Send(message string) (uint64, error) {
 	p.message = message
+	p.sendCalls++
 	return 1, p.err
 }
 
-func (p *fakePublisher) Flush() {
+func (p *fakePublisher) Flush() error {
 	p.flushed = true
-	if p.err == nil && !p.noAck {
-		p.acked++
+	p.flushCalls++
+	if len(p.flushErrors) > 0 {
+		err := p.flushErrors[0]
+		p.flushErrors = p.flushErrors[1:]
+		return err
 	}
-}
-
-func (p *fakePublisher) GetUniqueAckCount() uint64 {
-	return p.acked
+	return nil
 }
 
 func (p *fakePublisher) Close() error {
@@ -133,7 +137,7 @@ func TestPublisherReturnsClientError(t *testing.T) {
 	publisher := &Publisher{pub: fake}
 	event := model.NewTransactionBoundaryEvent(model.SourceMySQLBinlog, model.MySQLOffset{}, time.Now(), "tx-1", model.TxCommit)
 
-	if err := publisher.Publish(event); !errors.Is(err, want) {
+	if err := publisher.PublishContext(context.Background(), event); !errors.Is(err, want) {
 		t.Fatalf("Publish() error = %v, want wrapped %v", err, want)
 	}
 	if fake.flushed {
@@ -141,11 +145,65 @@ func TestPublisherReturnsClientError(t *testing.T) {
 	}
 }
 
-func TestPublisherRejectsMissingBrokerAcknowledgement(t *testing.T) {
-	publisher := &Publisher{pub: &fakePublisher{noAck: true}}
+func TestPublisherWaitsForSameDeliveryAfterAmbiguousTimeout(t *testing.T) {
+	fake := &fakePublisher{flushErrors: []error{
+		errors.New("producer flush timeout after 10ms"),
+		errors.New("producer flush timeout after 10ms"),
+	}}
+	var waits []time.Duration
+	publisher := &Publisher{
+		pub:          fake,
+		retryInitial: time.Millisecond,
+		retryMax:     2 * time.Millisecond,
+		wait: func(_ context.Context, delay time.Duration) error {
+			waits = append(waits, delay)
+			return nil
+		},
+	}
 	event := model.NewTransactionBoundaryEvent(model.SourceMySQLBinlog, model.MySQLOffset{}, time.Now(), "tx-1", model.TxCommit)
 
-	if err := publisher.Publish(event); err == nil || !strings.Contains(err.Error(), "acknowledgement") {
-		t.Fatalf("Publish() error = %v, want missing acknowledgement", err)
+	if err := publisher.PublishContext(context.Background(), event); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if fake.sendCalls != 1 {
+		t.Fatalf("Send() calls = %d, want 1 for the same producer sequence", fake.sendCalls)
+	}
+	if fake.flushCalls != 3 || len(waits) != 2 {
+		t.Fatalf("Flush() calls = %d waits = %d, want 3 and 2", fake.flushCalls, len(waits))
+	}
+}
+
+func TestPublisherStopsRetryingOnContextCancellation(t *testing.T) {
+	fake := &fakePublisher{flushErrors: []error{errors.New("producer flush timeout after 10ms")}}
+	ctx, cancel := context.WithCancel(context.Background())
+	publisher := &Publisher{
+		pub: fake,
+		wait: func(ctx context.Context, _ time.Duration) error {
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	}
+	event := model.NewTransactionBoundaryEvent(model.SourceMySQLBinlog, model.MySQLOffset{}, time.Now(), "tx-1", model.TxCommit)
+
+	if err := publisher.PublishContext(ctx, event); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Publish() error = %v, want context cancellation", err)
+	}
+	if fake.sendCalls != 1 {
+		t.Fatalf("Send() calls = %d, want 1", fake.sendCalls)
+	}
+}
+
+func TestPublisherReturnsNonRetryableBrokerError(t *testing.T) {
+	want := &sdk.BrokerError{Code: "PARTITION_LEADER_FENCED", Class: sdk.ErrorClassFencing, Retryable: false}
+	fake := &fakePublisher{flushErrors: []error{want}}
+	publisher := &Publisher{pub: fake}
+	event := model.NewTransactionBoundaryEvent(model.SourceMySQLBinlog, model.MySQLOffset{}, time.Now(), "tx-1", model.TxCommit)
+
+	if err := publisher.PublishContext(context.Background(), event); !errors.Is(err, want) {
+		t.Fatalf("Publish() error = %v, want wrapped %v", err, want)
+	}
+	if fake.flushCalls != 1 {
+		t.Fatalf("Flush() calls = %d, want 1", fake.flushCalls)
 	}
 }
