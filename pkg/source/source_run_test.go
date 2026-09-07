@@ -35,13 +35,34 @@ func (*blockingInspector) Start(ctx context.Context, _ chan<- model.Event) error
 }
 
 type fakeEventPublisher struct {
-	events []model.Event
-	err    error
-	closed bool
+	events   []model.Event
+	err      error
+	failures int
+	closed   bool
 }
 
-func (f *fakeEventPublisher) Publish(event model.Event) error {
-	if f.err != nil {
+type blockingEventPublisher struct {
+	started chan struct{}
+	ack     chan struct{}
+}
+
+func (p *blockingEventPublisher) PublishContext(ctx context.Context, _ model.Event) error {
+	close(p.started)
+	select {
+	case <-p.ack:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (*blockingEventPublisher) Close() error { return nil }
+
+func (f *fakeEventPublisher) PublishContext(_ context.Context, event model.Event) error {
+	if f.err != nil && (f.failures < 0 || f.failures > 0) {
+		if f.failures > 0 {
+			f.failures--
+		}
 		return f.err
 	}
 	f.events = append(f.events, event)
@@ -108,13 +129,48 @@ func TestRunSavesCheckpointOnlyAfterPublishSucceeds(t *testing.T) {
 	}
 }
 
+func TestRunDoesNotStoreCheckpointBeforeAcknowledgement(t *testing.T) {
+	offset := model.MySQLOffset{
+		File:    "mysql-bin.000011",
+		Pos:     797583888,
+		GTID:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:43",
+		GTIDSet: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-43",
+	}
+	path := filepath.Join(t.TempDir(), "commerce.binlog")
+	publisher := &blockingEventPublisher{started: make(chan struct{}), ack: make(chan struct{})}
+	source := &TabellariusSource{
+		ins:            &fakeInspector{events: transactionEvents(offset)},
+		pub:            publisher,
+		checkpointPath: path,
+	}
+	done := make(chan error, 1)
+	go func() { done <- source.Run(context.Background()) }()
+
+	select {
+	case <-publisher.started:
+	case <-time.After(time.Second):
+		t.Fatal("publish did not start")
+	}
+	if _, found, err := util.LoadJSONStrict[model.MySQLOffset](path); err != nil || found {
+		t.Fatalf("checkpoint stored before acknowledgement: found=%v err=%v", found, err)
+	}
+	close(publisher.ack)
+	if err := <-done; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	checkpoint, found, err := util.LoadJSONStrict[model.MySQLOffset](path)
+	if err != nil || !found || checkpoint != offset {
+		t.Fatalf("checkpoint after acknowledgement = %+v found=%v err=%v, want %+v", checkpoint, found, err, offset)
+	}
+}
+
 func TestRunDoesNotAdvanceCheckpointAfterPublishFailure(t *testing.T) {
 	want := errors.New("broker unavailable")
 	offset := model.MySQLOffset{File: "mysql-bin.000011", Pos: 99}
 	path := filepath.Join(t.TempDir(), "commerce.binlog")
 	source := &TabellariusSource{
 		ins:            &fakeInspector{events: transactionEvents(offset)},
-		pub:            &fakeEventPublisher{err: want},
+		pub:            &fakeEventPublisher{err: want, failures: -1},
 		checkpointPath: path,
 	}
 
@@ -124,6 +180,46 @@ func TestRunDoesNotAdvanceCheckpointAfterPublishFailure(t *testing.T) {
 	}
 	if _, found, loadErr := util.LoadJSONStrict[model.MySQLOffset](path); loadErr != nil || found {
 		t.Fatalf("checkpoint advanced after publish failure: found=%v err=%v", found, loadErr)
+	}
+}
+
+func TestRestartReprocessesSameGTIDAfterUnacknowledgedPublish(t *testing.T) {
+	want := errors.New("broker unavailable")
+	offset := model.MySQLOffset{
+		File:    "mysql-bin.000011",
+		Pos:     101,
+		GTID:    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:43",
+		GTIDSet: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:1-43",
+	}
+	path := filepath.Join(t.TempDir(), "commerce.binlog")
+	first := &TabellariusSource{
+		ins:            &fakeInspector{events: transactionEvents(offset)},
+		pub:            &fakeEventPublisher{err: want, failures: 1},
+		checkpointPath: path,
+	}
+
+	if err := first.Run(context.Background()); !errors.Is(err, want) {
+		t.Fatalf("first Run() error = %v, want wrapped %v", err, want)
+	}
+	if _, found, err := util.LoadJSONStrict[model.MySQLOffset](path); err != nil || found {
+		t.Fatalf("checkpoint advanced before acknowledgement: found=%v err=%v", found, err)
+	}
+
+	replayedPublisher := &fakeEventPublisher{}
+	restarted := &TabellariusSource{
+		ins:            &fakeInspector{events: transactionEvents(offset)},
+		pub:            replayedPublisher,
+		checkpointPath: path,
+	}
+	if err := restarted.Run(context.Background()); err != nil {
+		t.Fatalf("restarted Run() error = %v", err)
+	}
+	if len(replayedPublisher.events) != 1 || replayedPublisher.events[0].Offset().Compare(offset) != 0 {
+		t.Fatalf("replayed events = %#v, want the same GTID offset %s", replayedPublisher.events, offset.String())
+	}
+	checkpoint, found, err := util.LoadJSONStrict[model.MySQLOffset](path)
+	if err != nil || !found || checkpoint != offset {
+		t.Fatalf("checkpoint after replay = %+v found=%v err=%v, want %+v", checkpoint, found, err, offset)
 	}
 }
 

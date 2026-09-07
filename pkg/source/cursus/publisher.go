@@ -1,9 +1,13 @@
 package cursus
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
+	"strings"
 	"time"
 
 	"github.com/cursus-io/cursus/sdk"
@@ -11,7 +15,10 @@ import (
 )
 
 type Publisher struct {
-	pub publisherClient
+	pub          publisherClient
+	retryInitial time.Duration
+	retryMax     time.Duration
+	wait         func(context.Context, time.Duration) error
 }
 
 type PublisherOptions struct {
@@ -20,8 +27,7 @@ type PublisherOptions struct {
 
 type publisherClient interface {
 	Send(message string) (uint64, error)
-	Flush()
-	GetUniqueAckCount() uint64
+	Flush() error
 	Close() error
 }
 
@@ -79,8 +85,15 @@ func (p *Publisher) Close() error {
 }
 
 func (p *Publisher) Publish(evt model.Event) error {
+	return p.PublishContext(context.Background(), evt)
+}
+
+func (p *Publisher) PublishContext(ctx context.Context, evt model.Event) error {
 	if p.pub == nil {
 		return fmt.Errorf("broker publisher not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	eventJSON, err := marshalEvent(evt)
@@ -88,19 +101,78 @@ func (p *Publisher) Publish(evt model.Event) error {
 		return fmt.Errorf("failed to marshal event: %w", err)
 	}
 
-	ackCount := p.pub.GetUniqueAckCount()
 	_, err = p.pub.Send(string(eventJSON))
 	if err != nil {
 		return fmt.Errorf("failed to publish message to cursus: %w", err)
 	}
-	p.pub.Flush()
-	if p.pub.GetUniqueAckCount() <= ackCount {
-		return fmt.Errorf("failed to publish message to cursus: broker acknowledgement was not received")
+
+	backoff := p.initialRetryBackoff()
+	for attempt := 1; ; attempt++ {
+		if err := p.pub.Flush(); err != nil {
+			if !isRetryableDeliveryWait(err) {
+				return fmt.Errorf("failed to publish message to cursus: %w", err)
+			}
+			delay := jitteredBackoff(backoff)
+			log.Printf("component=cursus_publisher event=delivery_retry attempt=%d delay=%s error=%q", attempt, delay, err)
+			if err := p.waitForRetry(ctx, delay); err != nil {
+				return fmt.Errorf("wait for cursus acknowledgement: %w", err)
+			}
+			backoff = min(backoff*2, p.maximumRetryBackoff())
+			continue
+		}
+		break
 	}
 
 	p.logEvent(evt)
 
 	return nil
+}
+
+func (p *Publisher) initialRetryBackoff() time.Duration {
+	if p.retryInitial > 0 {
+		return p.retryInitial
+	}
+	return 250 * time.Millisecond
+}
+
+func (p *Publisher) maximumRetryBackoff() time.Duration {
+	if p.retryMax > 0 {
+		return p.retryMax
+	}
+	return 30 * time.Second
+}
+
+func (p *Publisher) waitForRetry(ctx context.Context, delay time.Duration) error {
+	if p.wait != nil {
+		return p.wait(ctx, delay)
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func jitteredBackoff(backoff time.Duration) time.Duration {
+	if backoff <= 1 {
+		return backoff
+	}
+	half := backoff / 2
+	return half + time.Duration(rand.Int64N(int64(backoff-half)+1))
+}
+
+func isRetryableDeliveryWait(err error) bool {
+	if err == nil {
+		return false
+	}
+	var brokerErr *sdk.BrokerError
+	if errors.As(err, &brokerErr) {
+		return brokerErr.Retryable
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "flush timeout")
 }
 
 func (p *Publisher) logEvent(evt model.Event) {

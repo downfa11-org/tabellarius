@@ -22,6 +22,13 @@ least one allowed row change. A checkpoint may advance only after Cursus has
 acknowledged that message. Transactions without allowed changes may advance the
 checkpoint without publishing.
 
+An ambiguous acknowledgement timeout does not enqueue the transaction again.
+Tabellarius sends the event once and waits again on that same producer delivery
+with jittered exponential backoff. This preserves the Cursus producer sequence
+and idempotence contract. Only an explicitly non-retryable broker response ends
+the stream; shutdown cancellation stops waiting without advancing the
+checkpoint.
+
 Delivery is at least once across the narrow interval between broker
 acknowledgement and checkpoint replacement. The transaction GTID remains stable
 across such a replay, so downstream stores must use it in their unique event key
@@ -46,11 +53,16 @@ checkpoint or advances after a failed publication.
 
 ## Failure contract
 
-A terminal binlog-stream error, publisher error, or checkpoint-write error is a
+A terminal binlog-stream error, non-retryable publisher error, or checkpoint-write error is a
 process-fatal condition. The process cancels its workers, closes the publisher
 and database connection, reports not-ready, and exits non-zero. Kubernetes then
 performs the retry from the last durable checkpoint. A terminal stream is never
 polled in a tight retry loop.
+
+Retryable broker availability failures and acknowledgement timeouts are handled
+in-process with bounded exponential backoff. They do not make the process
+unready and do not advance the checkpoint until the original delivery receives
+a successful acknowledgement.
 
 SIGINT and SIGTERM are graceful shutdowns. They stop intake, close dependencies,
 and return success without advancing an unacknowledged checkpoint.

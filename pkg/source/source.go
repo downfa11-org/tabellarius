@@ -13,7 +13,7 @@ import (
 )
 
 type eventPublisher interface {
-	Publish(model.Event) error
+	PublishContext(context.Context, model.Event) error
 	Close() error
 }
 
@@ -93,7 +93,10 @@ func (s *TabellariusSource) run(ctx context.Context, in <-chan model.Event) erro
 				txBuffer[e.TxID()] = append(txBuffer[e.TxID()], e.Changes()...)
 
 			case *model.BinlogDDLEvent:
-				if err := s.pub.Publish(e); err != nil {
+				if err := s.pub.PublishContext(ctx, e); err != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
 					s.status.PublishFailed()
 					return fmt.Errorf("publish DDL event: %w", err)
 				}
@@ -107,7 +110,10 @@ func (s *TabellariusSource) run(ctx context.Context, in <-chan model.Event) erro
 					changes := txBuffer[e.TxID()]
 					if len(changes) > 0 {
 						txEvt := model.NewTransactionEvent(lastSource, lastOffset, e.Timestamp(), e.TxID(), changes)
-						if err := s.pub.Publish(txEvt); err != nil {
+						if err := s.pub.PublishContext(ctx, txEvt); err != nil {
+							if ctx.Err() != nil {
+								return nil
+							}
 							s.status.PublishFailed()
 							return fmt.Errorf("publish transaction %s: %w", e.TxID(), err)
 						}
